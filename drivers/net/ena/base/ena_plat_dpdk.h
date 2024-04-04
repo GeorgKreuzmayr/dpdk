@@ -115,12 +115,7 @@ extern int ena_logtype_com;
 #define GENMASK_ULL(h, l) (((~0ULL) - (1ULL << (l)) + 1) &		       \
 			  (~0ULL >> (BITS_PER_LONG_LONG - 1 - (h))))
 
-#define ena_trc_log(dev, level, fmt, arg...)				       \
-	(								       \
-		ENA_TOUCH(dev),						       \
-		rte_log(RTE_LOG_ ## level, ena_logtype_com,		       \
-			"[ENA_COM: %s]" fmt, __func__, ##arg)		       \
-	)
+#define ena_trc_log(dev, level, fmt, arg...)				     
 
 #define ena_trc_dbg(dev, format, arg...) ena_trc_log(dev, DEBUG, format, ##arg)
 #define ena_trc_info(dev, format, arg...) ena_trc_log(dev, INFO, format, ##arg)
