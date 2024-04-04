@@ -11,6 +11,7 @@
 #include <rte_kvargs.h>
 
 #include "ena_ethdev.h"
+#include "custom_ena.h"
 #include "ena_logs.h"
 #include "ena_platform.h"
 #include "ena_com.h"
@@ -224,7 +225,9 @@ static void ena_tx_map_mbuf(struct ena_ring *tx_ring,
 	void **push_header,
 	uint16_t *header_len);
 static int ena_xmit_mbuf(struct ena_ring *tx_ring, struct rte_mbuf *mbuf);
+static int ena_xmit_mbuf_custom(struct ena_ring *tx_ring, struct rte_mbuf *mbuf);
 static int ena_tx_cleanup(void *txp, uint32_t free_pkt_cnt);
+static int ena_tx_cleanup_custom(void *txp);
 static uint16_t eth_ena_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 				  uint16_t nb_pkts);
 static uint16_t eth_ena_prep_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
@@ -2763,6 +2766,97 @@ static struct rte_mbuf *ena_rx_mbuf(struct ena_ring *rx_ring,
 
 	return mbuf_head;
 }
+uint16_t eth_ena_recv_pkts_custom(void *rx_queue, struct rte_mbuf **rx_pkts,
+				  uint16_t nb_pkts)
+{
+	struct ena_ring *rx_ring = (struct ena_ring *)(rx_queue);
+	unsigned int free_queue_entries;
+	uint16_t next_to_clean = rx_ring->next_to_clean;
+	uint16_t descs_in_use;
+	struct rte_mbuf *mbuf;
+	uint16_t completed;
+	struct ena_com_rx_ctx ena_rx_ctx;
+	int i, rc = 0;
+	bool fill_hash;
+
+#ifdef RTE_ETHDEV_DEBUG_RX
+	/* Check adapter state */
+	if (unlikely(rx_ring->adapter->state != ENA_ADAPTER_STATE_RUNNING)) {
+		PMD_RX_LOG(ALERT,
+			"Trying to receive pkts while device is NOT running\n");
+		return 0;
+	}
+#endif
+
+	fill_hash = rx_ring->offloads & RTE_ETH_RX_OFFLOAD_RSS_HASH;
+
+	descs_in_use = rx_ring->ring_size -
+		ena_com_free_q_entries(rx_ring->ena_com_io_sq) - 1;
+	nb_pkts = RTE_MIN(descs_in_use, nb_pkts);
+
+	for (completed = 0; completed < nb_pkts; completed++) {
+		ena_rx_ctx.max_bufs = rx_ring->sgl_size;
+		ena_rx_ctx.ena_bufs = rx_ring->ena_bufs;
+		ena_rx_ctx.descs = 0;
+		ena_rx_ctx.pkt_offset = 0;
+		/* receive packet context */
+		rc = ena_com_rx_pkt(rx_ring->ena_com_io_cq,
+				    rx_ring->ena_com_io_sq,
+				    &ena_rx_ctx);
+		if (unlikely(rc)) {
+			PMD_RX_LOG(ERR,
+				"Failed to get the packet from the device, rc: %d\n",
+				rc);
+			if (rc == ENA_COM_NO_SPACE) {
+				++rx_ring->rx_stats.bad_desc_num;
+				ena_trigger_reset(rx_ring->adapter,
+					ENA_REGS_RESET_TOO_MANY_RX_DESCS);
+			} else {
+				++rx_ring->rx_stats.bad_req_id;
+				ena_trigger_reset(rx_ring->adapter,
+					ENA_REGS_RESET_INV_RX_REQ_ID);
+			}
+			return 0;
+		}
+
+		mbuf = ena_rx_mbuf(rx_ring,
+			ena_rx_ctx.ena_bufs,
+			ena_rx_ctx.descs,
+			&next_to_clean,
+			ena_rx_ctx.pkt_offset);
+		if (unlikely(mbuf == NULL)) {
+			for (i = 0; i < ena_rx_ctx.descs; ++i) {
+				rx_ring->empty_rx_reqs[next_to_clean] =
+					rx_ring->ena_bufs[i].req_id;
+				next_to_clean = ENA_IDX_NEXT_MASKED(
+					next_to_clean, rx_ring->size_mask);
+			}
+			break;
+		}
+
+		/* fill mbuf attributes if any */
+		ena_rx_mbuf_prepare(rx_ring, mbuf, &ena_rx_ctx, fill_hash);
+
+		if (unlikely(mbuf->ol_flags &
+				(RTE_MBUF_F_RX_IP_CKSUM_BAD | RTE_MBUF_F_RX_L4_CKSUM_BAD)))
+			rte_atomic64_inc(&rx_ring->adapter->drv_stats->ierrors);
+
+		rx_pkts[completed] = mbuf;
+		rx_ring->rx_stats.bytes += mbuf->pkt_len;
+	}
+
+	rx_ring->rx_stats.cnt += completed;
+	rx_ring->next_to_clean = next_to_clean;
+
+	free_queue_entries = ena_com_free_q_entries(rx_ring->ena_com_io_sq);
+
+	/* Burst refill to save doorbells, memory barriers, const interval */
+	if (free_queue_entries >= rx_ring->rx_free_thresh) {
+		ena_populate_rx_queue(rx_ring, free_queue_entries);
+	}
+
+	return completed;
+}
 
 static uint16_t eth_ena_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 				  uint16_t nb_pkts)
@@ -3179,6 +3273,203 @@ static int ena_xmit_mbuf(struct ena_ring *tx_ring, struct rte_mbuf *mbuf)
 
 	return 0;
 }
+
+static int ena_xmit_mbuf_custom(struct ena_ring *tx_ring, struct rte_mbuf *mbuf)
+{
+	struct ena_tx_buffer *tx_info;
+	struct ena_com_tx_ctx ena_tx_ctx = { { 0 } };
+	uint16_t next_to_use;
+	uint16_t header_len;
+	uint16_t req_id;
+	void *push_header;
+	int nb_hw_desc;
+	int rc;
+
+	/* Checking for space for 2 additional metadata descriptors due to
+	 * possible header split and metadata descriptor
+	 */
+	if (!ena_com_sq_have_enough_space(tx_ring->ena_com_io_sq,
+					  mbuf->nb_segs + 2)) {
+		PMD_DRV_LOG(DEBUG, "Not enough space in the tx queue\n");
+		return ENA_COM_NO_MEM;
+	}
+
+	next_to_use = tx_ring->next_to_use;
+
+	req_id = tx_ring->empty_tx_reqs[next_to_use];
+	tx_info = &tx_ring->tx_buffer_info[req_id];
+	tx_info->num_of_bufs = 0;
+	RTE_ASSERT(tx_info->mbuf == NULL);
+
+	ena_tx_map_mbuf(tx_ring, tx_info, mbuf, &push_header, &header_len);
+
+	ena_tx_ctx.ena_bufs = tx_info->bufs;
+	ena_tx_ctx.push_header = push_header;
+	ena_tx_ctx.num_bufs = tx_info->num_of_bufs;
+	ena_tx_ctx.req_id = req_id;
+	ena_tx_ctx.header_len = header_len;
+
+	/* Set Tx offloads flags, if applicable */
+	ena_tx_mbuf_prepare(mbuf, &ena_tx_ctx, tx_ring->offloads,
+		tx_ring->disable_meta_caching);
+
+	if (unlikely(ena_com_is_doorbell_needed(tx_ring->ena_com_io_sq,
+			&ena_tx_ctx))) {
+		PMD_TX_LOG(DEBUG,
+			"LLQ Tx max burst size of queue %d achieved, writing doorbell to send burst\n",
+			tx_ring->id);
+		ena_com_write_sq_doorbell(tx_ring->ena_com_io_sq);
+		tx_ring->tx_stats.doorbells++;
+		tx_ring->pkts_without_db = false;
+	}
+
+	/* prepare the packet's descriptors to dma engine */
+	rc = ena_com_prepare_tx(tx_ring->ena_com_io_sq,	&ena_tx_ctx,
+		&nb_hw_desc);
+	if (unlikely(rc)) {
+		PMD_DRV_LOG(ERR, "Failed to prepare Tx buffers, rc: %d\n", rc);
+		++tx_ring->tx_stats.prepare_ctx_err;
+		ena_trigger_reset(tx_ring->adapter,
+			ENA_REGS_RESET_DRIVER_INVALID_STATE);
+		return rc;
+	}
+
+	tx_info->tx_descs = nb_hw_desc;
+	tx_info->timestamp = rte_get_timer_cycles();
+
+	tx_ring->tx_stats.cnt++;
+	tx_ring->tx_stats.bytes += mbuf->pkt_len;
+
+	tx_ring->next_to_use = ENA_IDX_NEXT_MASKED(next_to_use,
+		tx_ring->size_mask);
+
+	return 0;
+}
+
+static __rte_always_inline size_t
+ena_tx_cleanup_mbuf_fast(struct rte_mbuf **mbufs_to_clean,
+			 struct rte_mbuf *mbuf,
+			 size_t mbuf_cnt,
+			 size_t buf_size)
+{
+	struct rte_mbuf *m_next;
+
+	while (mbuf != NULL) {
+		m_next = mbuf->next;
+		mbufs_to_clean[mbuf_cnt++] = mbuf;
+		if (mbuf_cnt == buf_size) {
+			rte_pktmbuf_free_bulk(mbufs_to_clean, mbuf_cnt);
+			mbuf_cnt = 0;
+		}
+		mbuf = m_next;
+	}
+
+	return mbuf_cnt;
+}
+
+/*
+Does not free packets
+*/
+static int ena_tx_cleanup_custom(void *txp)
+{
+struct ena_ring *tx_ring = (struct ena_ring *)txp;
+unsigned int total_tx_descs = 0;
+unsigned int total_tx_pkts = 0;
+uint16_t cleanup_budget;
+uint16_t next_to_clean = tx_ring->next_to_clean;
+
+/*
+	* If free_pkt_cnt is equal to 0, it means that the user requested
+	* full cleanup, so attempt to release all Tx descriptors
+	* (ring_size - 1 -> size_mask)
+	*/
+cleanup_budget = tx_ring->size_mask;
+
+while (likely(total_tx_pkts < cleanup_budget)) {
+	struct ena_tx_buffer *tx_info;
+	uint16_t req_id;
+
+	if (ena_com_tx_comp_req_id_get(tx_ring->ena_com_io_cq, &req_id) != 0)
+		break;
+
+	if (unlikely(validate_tx_req_id(tx_ring, req_id) != 0))
+		break;
+
+	/* Get Tx info & store how many descs were processed  */
+	tx_info = &tx_ring->tx_buffer_info[req_id];
+	tx_info->timestamp = 0;
+
+	tx_info->mbuf = NULL;
+	tx_ring->empty_tx_reqs[next_to_clean] = req_id;
+
+	total_tx_descs += tx_info->tx_descs;
+	total_tx_pkts++;
+
+	/* Put back descriptor to the ring for reuse */
+	next_to_clean = ENA_IDX_NEXT_MASKED(next_to_clean,
+		tx_ring->size_mask);
+}
+
+if (likely(total_tx_descs > 0)) {
+	/* acknowledge completion of sent packets */
+	tx_ring->next_to_clean = next_to_clean;
+	ena_com_comp_ack(tx_ring->ena_com_io_sq, total_tx_descs);
+}
+
+/* Notify completion handler that full cleanup was performed */
+tx_ring->last_cleanup_ticks = rte_get_timer_cycles();
+
+return total_tx_pkts;
+}
+
+uint16_t  eth_ena_xmit_pkts_custom(void *tx_queue, struct rte_mbuf **tx_pkts,
+																uint16_t nb_pkts) {
+struct ena_ring *tx_ring = (struct ena_ring *)(tx_queue);
+uint16_t sent_idx = 0;
+
+#ifdef RTE_ETHDEV_DEBUG_TX
+/* Check adapter state */
+if (unlikely(tx_ring->adapter->state != ENA_ADAPTER_STATE_RUNNING)) {
+	PMD_TX_LOG(ALERT,
+		"Trying to xmit pkts while device is NOT running\n");
+	return 0;
+}
+#endif
+
+// Always perform cleanup of last batch
+ena_tx_cleanup_custom((void *)tx_ring);
+
+for (sent_idx = 0; sent_idx < nb_pkts; sent_idx++) {
+	if (ena_xmit_mbuf_custom(tx_ring, tx_pkts[sent_idx]))
+		break;
+	tx_ring->pkts_without_db = true;
+	rte_prefetch0(tx_pkts[ENA_IDX_ADD_MASKED(sent_idx, 4,
+		tx_ring->size_mask)]);
+}
+
+/* If there are ready packets to be xmitted... */
+if (likely(tx_ring->pkts_without_db)) {
+	/* ...let HW do its best :-) */
+	ena_com_write_sq_doorbell(tx_ring->ena_com_io_sq);
+	tx_ring->tx_stats.doorbells++;
+	tx_ring->pkts_without_db = false;
+}
+
+tx_ring->tx_stats.available_desc =
+	ena_com_free_q_entries(tx_ring->ena_com_io_sq);
+tx_ring->tx_stats.tx_poll++;
+
+return sent_idx;
+}
+
+uint16_t  ena_com_tx_sq_entries(void *tx_queue){
+struct ena_ring *tx_ring = (struct ena_ring *)(tx_queue);
+return ena_com_free_q_entries(tx_ring->ena_com_io_sq);
+}
+uint16_t  ena_com_tx_cq_entries(void */*tx_queue*/){
+return 0;
+}
+
 
 static int ena_tx_cleanup(void *txp, uint32_t free_pkt_cnt)
 {

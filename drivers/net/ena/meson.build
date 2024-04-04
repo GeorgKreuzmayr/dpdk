@@ -14,6 +14,12 @@ sources = files(
         'base/ena_eth_com.c',
 )
 
+headers = files(
+        'custom_ena.h',
+)
+
+install_headers(headers)
+
 deps += ['timer']
 
 includes += include_directories('base', 'base/ena_defs')

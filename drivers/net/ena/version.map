@@ -1,0 +1,9 @@
+DPDK_24 {
+	global:
+	eth_ena_recv_pkts_custom;
+	eth_ena_xmit_pkts_custom;
+	ena_com_tx_sq_entries;
+	ena_com_tx_cq_entries;
+
+	local: *;
+};
